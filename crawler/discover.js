@@ -1,12 +1,18 @@
-import { chromium } from "playwright";
-import fs from "node:fs/promises";
-import { BASE_URL, CATEGORIES, TIMEOUTS } from "./config.js";
+const { chromium } = require("playwright");
+const {
+  BASE,
+  CATEGORIES,
+  PAGE_TIMEOUT,
+  MAX_CATEGORY_PAGES
+} = require("./config");
+
+const { sleep, writeJson, ensureDir } = require("./utils");
 
 function normalizeUrl(href) {
   try {
-    const url = new URL(href, BASE_URL);
+    const url = new URL(href, BASE);
 
-    if (url.origin !== BASE_URL) return null;
+    if (url.origin !== BASE) return null;
 
     url.hash = "";
     url.search = "";
@@ -21,14 +27,14 @@ function looksLikeGameUrl(url) {
   try {
     const u = new URL(url);
 
-    if (u.origin !== BASE_URL) return false;
+    if (u.origin !== BASE) return false;
 
     const parts = u.pathname.split("/").filter(Boolean);
 
     // Game pages on eaglercraftgame.io are root-level:
     // /minecraft-classic
     // /eaglecraft-1122-u2
-    // /paper-minecraft
+    // /minecraft-survival
     if (parts.length !== 1) return false;
 
     const slug = parts[0].toLowerCase();
@@ -57,107 +63,170 @@ function looksLikeGameUrl(url) {
   }
 }
 
-async function discoverCategory(page, categoryUrl) {
-  console.log(`Discovering: ${categoryUrl}`);
+async function discoverCategory(browser, category, startPath) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
-  const response = await page.goto(categoryUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: TIMEOUTS.navigation
-  });
+  const found = new Map();
 
-  await page.waitForTimeout(2000);
+  const diagnostics = {
+    category,
+    categoryUrl: BASE + startPath,
+    pages: []
+  };
 
-  const status = response?.status() ?? null;
-  const finalUrl = page.url();
-  const title = await page.title();
+  try {
+    for (let n = 1; n <= MAX_CATEGORY_PAGES; n++) {
+      const url =
+        n === 1
+          ? BASE + startPath
+          : BASE + startPath + "?page=" + n;
 
-  console.log(`  status: ${status}`);
-  console.log(`  final URL: ${finalUrl}`);
-  console.log(`  title: ${title}`);
+      console.log(`Discovering ${category}, page ${n}: ${url}`);
 
-  const links = await page.locator("a[href]").evaluateAll((anchors) =>
-    anchors.map((a) => ({
-      href: a.href,
-      text: (a.textContent || "").trim()
-    }))
-  );
+      let response = null;
+      let navigationError = null;
 
-  console.log(`  anchors found: ${links.length}`);
+      try {
+        response = await page.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: PAGE_TIMEOUT
+        });
 
-  const candidates = [];
+        await page
+          .waitForLoadState("networkidle", { timeout: 7000 })
+          .catch(() => {});
 
-  for (const link of links) {
-    const normalized = normalizeUrl(link.href);
+        await sleep(1000);
+      } catch (error) {
+        navigationError = error.message;
+      }
 
-    if (!normalized) continue;
+      const status = response ? response.status() : null;
+      const finalUrl = page.url();
+      const title = await page.title().catch(() => "");
 
-    if (looksLikeGameUrl(normalized)) {
-      candidates.push({
-        url: normalized,
-        title: link.text
+      const links = await page
+        .locator("a[href]")
+        .evaluateAll((anchors) =>
+          anchors.map((a) => ({
+            href: a.href,
+            text: (a.textContent || "").trim()
+          }))
+        )
+        .catch(() => []);
+
+      const candidates = [];
+
+      for (const link of links) {
+        const normalized = normalizeUrl(link.href);
+
+        if (!normalized) continue;
+
+        if (looksLikeGameUrl(normalized)) {
+          candidates.push({
+            url: normalized,
+            title: link.text
+          });
+        }
+      }
+
+      let added = 0;
+
+      for (const candidate of candidates) {
+        if (!found.has(candidate.url)) {
+          found.set(candidate.url, {
+            name: candidate.title || candidate.url,
+            slug: new URL(candidate.url).pathname
+              .replace(/^\//, ""),
+            url: candidate.url,
+            category
+          });
+
+          added++;
+        }
+      }
+
+      diagnostics.pages.push({
+        page: n,
+        requestedUrl: url,
+        finalUrl,
+        status,
+        title,
+        anchorCount: links.length,
+        candidateCount: candidates.length,
+        added,
+        navigationError
       });
-    }
-  }
 
-  const unique = new Map();
+      console.log(
+        `  status=${status} anchors=${links.length} candidates=${candidates.length} added=${added}`
+      );
 
-  for (const item of candidates) {
-    if (!unique.has(item.url)) {
-      unique.set(item.url, item);
+      /*
+       * If pagination produces no new games, stop.
+       *
+       * We allow page 1 to finish even if it somehow contains zero
+       * candidates, so diagnostics can tell us what happened.
+       */
+      if (n > 1 && added === 0) {
+        break;
+      }
+
+      await sleep(300);
     }
+  } finally {
+    await context.close();
   }
 
   return {
-    categoryUrl,
-    finalUrl,
-    status,
-    title,
-    anchorCount: links.length,
-    games: [...unique.values()]
+    games: [...found.values()],
+    diagnostics
   };
 }
 
-export async function discoverGames(category = "all") {
+async function discoverAll(which = "all") {
+  ensureDir("results");
+
   const browser = await chromium.launch({
     headless: true
   });
 
-  const page = await browser.newPage();
-
-  page.setDefaultNavigationTimeout(TIMEOUTS.navigation);
-
-  const categories =
-    category === "all"
-      ? Object.entries(CATEGORIES)
-      : [[category, CATEGORIES[category]]];
-
-  const discovered = [];
+  const allGames = [];
   const diagnostics = [];
 
   try {
-    for (const [name, categoryUrl] of categories) {
+    const categories =
+      which === "all"
+        ? Object.keys(CATEGORIES)
+        : [which];
+
+    for (const category of categories) {
+      if (!CATEGORIES[category]) {
+        console.log(`Unknown category: ${category}`);
+        continue;
+      }
+
       try {
-        const result = await discoverCategory(page, categoryUrl);
+        const result = await discoverCategory(
+          browser,
+          category,
+          CATEGORIES[category]
+        );
 
-        diagnostics.push(result);
-
-        for (const game of result.games) {
-          discovered.push({
-            category: name,
-            url: game.url,
-            title: game.title
-          });
-        }
+        allGames.push(...result.games);
+        diagnostics.push(result.diagnostics);
 
         console.log(
-          `  ${name}: ${result.games.length} game candidates`
+          `${category}: ${result.games.length} game candidates`
         );
       } catch (error) {
-        console.error(`  ${name}: FAILED`);
-        console.error(error.message);
+        console.error(
+          `${category}: discovery failed: ${error.message}`
+        );
 
         diagnostics.push({
-          categoryUrl,
+          category,
           error: error.message,
           games: []
         });
@@ -168,32 +237,31 @@ export async function discoverGames(category = "all") {
   }
 
   // Deduplicate by URL.
-  const unique = new Map();
+  const unique = [
+    ...new Map(
+      allGames.map((game) => [game.url, game])
+    ).values()
+  ];
 
-  for (const game of discovered) {
-    if (!unique.has(game.url)) {
-      unique.set(game.url, game);
-    }
-  }
-
-  const result = {
+  const output = {
     generated_at: new Date().toISOString(),
-    source: BASE_URL,
-    category,
-    count: unique.size,
-    games: [...unique.values()],
+    source: BASE,
+    category: which,
+    count: unique.length,
+    games: unique,
     diagnostics
   };
 
-  await fs.mkdir("results", { recursive: true });
-
-  await fs.writeFile(
-    "results/discovered.json",
-    JSON.stringify(result, null, 2)
-  );
+  writeJson("results/discovered.json", output);
 
   console.log("");
-  console.log(`DISCOVERY COMPLETE: ${unique.size} games`);
+  console.log("========================================");
+  console.log(`DISCOVERY COMPLETE: ${unique.length} games`);
+  console.log("========================================");
 
-  return [...unique.values()];
+  return unique;
 }
+
+module.exports = {
+  discoverAll
+};
