@@ -1,26 +1,199 @@
-const {chromium}=require("playwright");
-const {BASE,CATEGORIES,PAGE_TIMEOUT,MAX_CATEGORY_PAGES}=require("./config");
-const {sleep}=require("./utils");
+import { chromium } from "playwright";
+import fs from "node:fs/promises";
+import { BASE_URL, CATEGORIES, TIMEOUTS } from "./config.js";
 
-async function discoverCategory(browser,category,startPath){
-  const ctx=await browser.newContext(); const page=await ctx.newPage(); const found=new Map();
-  try{
-    for(let n=1;n<=MAX_CATEGORY_PAGES;n++){
-      const url=n===1?BASE+startPath:BASE+startPath+"?page="+n;
-      try{await page.goto(url,{waitUntil:"domcontentloaded",timeout:PAGE_TIMEOUT});await page.waitForLoadState("networkidle",{timeout:7000}).catch(()=>{});}catch{}
-      const games=await page.evaluate(base=>[...document.querySelectorAll("a[href]")].map(a=>({name:(a.innerText||a.textContent||"").trim(),url:a.href})).filter(x=>{try{const u=new URL(x.url);return u.origin===base&&u.pathname.split("/").filter(Boolean).length===1&&!u.pathname.startsWith("/games/")}catch{return false}}),BASE);
-      let added=0;
-      for(const g of games){const slug=new URL(g.url).pathname.replace(/^\//,"");if(!found.has(g.url)){found.set(g.url,{name:g.name,slug,url:g.url,category});added++}}
-      if(n>1&&added===0) break;
-      await sleep(300);
+function normalizeUrl(href) {
+  try {
+    const url = new URL(href, BASE_URL);
+
+    if (url.origin !== BASE_URL) return null;
+
+    url.hash = "";
+    url.search = "";
+
+    return url.href.replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeGameUrl(url) {
+  try {
+    const u = new URL(url);
+
+    if (u.origin !== BASE_URL) return false;
+
+    const parts = u.pathname.split("/").filter(Boolean);
+
+    // Game pages on eaglercraftgame.io are root-level:
+    // /minecraft-classic
+    // /eaglecraft-1122-u2
+    // /paper-minecraft
+    if (parts.length !== 1) return false;
+
+    const slug = parts[0].toLowerCase();
+
+    const ignored = new Set([
+      "games",
+      "game",
+      "about",
+      "contact",
+      "privacy-policy",
+      "terms-of-service",
+      "login",
+      "register",
+      "search",
+      "category",
+      "categories",
+      "sitemap",
+      "robots"
+    ]);
+
+    if (ignored.has(slug)) return false;
+
+    return /^[a-z0-9][a-z0-9-]*$/.test(slug);
+  } catch {
+    return false;
+  }
+}
+
+async function discoverCategory(page, categoryUrl) {
+  console.log(`Discovering: ${categoryUrl}`);
+
+  const response = await page.goto(categoryUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: TIMEOUTS.navigation
+  });
+
+  await page.waitForTimeout(2000);
+
+  const status = response?.status() ?? null;
+  const finalUrl = page.url();
+  const title = await page.title();
+
+  console.log(`  status: ${status}`);
+  console.log(`  final URL: ${finalUrl}`);
+  console.log(`  title: ${title}`);
+
+  const links = await page.locator("a[href]").evaluateAll((anchors) =>
+    anchors.map((a) => ({
+      href: a.href,
+      text: (a.textContent || "").trim()
+    }))
+  );
+
+  console.log(`  anchors found: ${links.length}`);
+
+  const candidates = [];
+
+  for (const link of links) {
+    const normalized = normalizeUrl(link.href);
+
+    if (!normalized) continue;
+
+    if (looksLikeGameUrl(normalized)) {
+      candidates.push({
+        url: normalized,
+        title: link.text
+      });
     }
-  }finally{await ctx.close()}
-  return [...found.values()];
+  }
+
+  const unique = new Map();
+
+  for (const item of candidates) {
+    if (!unique.has(item.url)) {
+      unique.set(item.url, item);
+    }
+  }
+
+  return {
+    categoryUrl,
+    finalUrl,
+    status,
+    title,
+    anchorCount: links.length,
+    games: [...unique.values()]
+  };
 }
-async function discoverAll(which="all"){
-  const b=await chromium.launch({headless:true}); const out=[];
-  try{for(const c of (which==="all"?Object.keys(CATEGORIES):[which])) if(CATEGORIES[c]) out.push(...await discoverCategory(b,c,CATEGORIES[c]))}
-  finally{await b.close()}
-  return [...new Map(out.map(x=>[x.url,x])).values()];
+
+export async function discoverGames(category = "all") {
+  const browser = await chromium.launch({
+    headless: true
+  });
+
+  const page = await browser.newPage();
+
+  page.setDefaultNavigationTimeout(TIMEOUTS.navigation);
+
+  const categories =
+    category === "all"
+      ? Object.entries(CATEGORIES)
+      : [[category, CATEGORIES[category]]];
+
+  const discovered = [];
+  const diagnostics = [];
+
+  try {
+    for (const [name, categoryUrl] of categories) {
+      try {
+        const result = await discoverCategory(page, categoryUrl);
+
+        diagnostics.push(result);
+
+        for (const game of result.games) {
+          discovered.push({
+            category: name,
+            url: game.url,
+            title: game.title
+          });
+        }
+
+        console.log(
+          `  ${name}: ${result.games.length} game candidates`
+        );
+      } catch (error) {
+        console.error(`  ${name}: FAILED`);
+        console.error(error.message);
+
+        diagnostics.push({
+          categoryUrl,
+          error: error.message,
+          games: []
+        });
+      }
+    }
+  } finally {
+    await browser.close();
+  }
+
+  // Deduplicate by URL.
+  const unique = new Map();
+
+  for (const game of discovered) {
+    if (!unique.has(game.url)) {
+      unique.set(game.url, game);
+    }
+  }
+
+  const result = {
+    generated_at: new Date().toISOString(),
+    source: BASE_URL,
+    category,
+    count: unique.size,
+    games: [...unique.values()],
+    diagnostics
+  };
+
+  await fs.mkdir("results", { recursive: true });
+
+  await fs.writeFile(
+    "results/discovered.json",
+    JSON.stringify(result, null, 2)
+  );
+
+  console.log("");
+  console.log(`DISCOVERY COMPLETE: ${unique.size} games`);
+
+  return [...unique.values()];
 }
-module.exports={discoverAll};
