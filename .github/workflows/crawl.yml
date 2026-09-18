@@ -1,0 +1,52 @@
+name: GN-Math Game Source Crawler
+
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: Category
+        required: true
+        default: minecraft
+        type: choice
+        options: [all, minecraft, crafting, sandbox]
+      max_games:
+        description: Maximum games (0 = all)
+        required: true
+        default: "5"
+        type: string
+      click_play:
+        description: Try Play/Start buttons
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
+      - name: Crawl
+        env:
+          CRAWL_CATEGORY: ${{ inputs.category }}
+          CRAWL_MAX_GAMES: ${{ inputs.max_games }}
+          CRAWL_CLICK_PLAY: ${{ inputs.click_play }}
+        run: node crawler/index.js
+      - name: Build CSV
+        run: node crawler/analyze-hars.js
+      - name: Commit results
+        run: |
+          git config user.name "gnmath-crawler[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results
+          git diff --cached --quiet || git commit -m "Update game source scan"
+          git push

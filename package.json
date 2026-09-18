@@ -1,0 +1,1 @@
+{"name":"gnmath-eaglercraft-source-crawler","version":"1.0.0","private":true,"scripts":{"crawl":"node crawler/index.js","analyze":"node crawler/analyze-hars.js"},"dependencies":{"playwright":"^1.55.0"}}
